@@ -52,14 +52,9 @@ jobs:
       - name: Set envs and start
         run: |
           cf set-env ewp-server UUID "${{ secrets.EWP_UUID }}"
-          cf set-env ewp-server WS_PATH "${{ secrets.EWP_WS_PATH }}"
+          cf set-env ewp-server GRPC_SERVICE "${{ secrets.EWP_GRPC_SERVICE }}"
           if [ -n "${{ secrets.CLOUDFLARED_TOKEN }}" ]; then
             cf set-env ewp-server CLOUDFLARED_TOKEN "${{ secrets.CLOUDFLARED_TOKEN }}"
-          fi
-          if [ -n "${{ secrets.CF_ACCOUNT_ID }}" ]; then
-            cf set-env ewp-server CF_ACCOUNT_ID "${{ secrets.CF_ACCOUNT_ID }}"
-            cf set-env ewp-server CF_TUNNEL_ID  "${{ secrets.CF_TUNNEL_ID }}"
-            cf set-env ewp-server CF_API_TOKEN  "${{ secrets.CF_API_TOKEN }}"
           fi
           cf start ewp-server
 

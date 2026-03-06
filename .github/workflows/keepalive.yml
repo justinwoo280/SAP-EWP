@@ -1,0 +1,40 @@
+name: Keep Alive - Restart ewp-server
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  restart:
+    name: Restart ewp-server on SAP BTP CF
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install CF CLI
+        run: |
+          wget -q -O - https://packages.cloudfoundry.org/debian/cli.cloudfoundry.org.key | sudo apt-key add -
+          echo "deb https://packages.cloudfoundry.org/debian stable main" | sudo tee /etc/apt/sources.list.d/cloudfoundry-cli.list
+          sudo apt-get update && sudo apt-get install -y cf8-cli
+
+      - name: Login to SAP BTP Cloud Foundry
+        run: |
+          cf api "${{ secrets.CF_API }}"
+          cf auth "${{ secrets.CF_USERNAME }}" "${{ secrets.CF_PASSWORD }}"
+          cf target -o "${{ secrets.CF_ORG }}" -s "${{ secrets.CF_SPACE }}"
+
+      - name: Restart app
+        run: |
+          STATUS=$(cf app ewp-server | grep "requested state:" | awk '{print $3}')
+          echo "[keepalive] Current state: ${STATUS}"
+          if [ "$STATUS" = "stopped" ]; then
+            echo "[keepalive] App is stopped, starting..."
+            cf start ewp-server
+          else
+            echo "[keepalive] App is running, restarting..."
+            cf restart ewp-server
+          fi
+
+      - name: Verify
+        run: |
+          cf app ewp-server | grep -E "state|memory|instances"
