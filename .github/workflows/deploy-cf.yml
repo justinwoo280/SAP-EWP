@@ -14,7 +14,7 @@ jobs:
       - name: Download ewp-core server binary
         run: |
           curl -fsSL \
-            https://github.com/justinwoo280/ech-workers/releases/download/v1.13.4/ewp-core-server-v1.13.4-linux-amd64 \
+            https://github.com/justinwoo280/ech-workers/releases/download/v1.14/ewp-core-server-v1.14-linux-amd64 \
             -o ewp-server
           chmod +x ewp-server
 
