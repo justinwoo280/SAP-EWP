@@ -1,12 +1,28 @@
 applications:
   - name: ewp-server
-    memory: 128M
-    disk_quota: 256M
+    # sing-box (with EWP outbound) + gRPC inbound, fronted by the
+    # SAP API Management gateway which terminates TLS upstream.
+    # The container itself speaks plaintext h2c on $PORT, since the
+    # gateway re-wraps the connection with its own TLS cert.
+    memory: 256M
+    disk_quota: 512M
     instances: 5
     buildpacks:
       - binary_buildpack
     command: bash start.sh
-    health-check-type: http
-    health-check-http-endpoint: /
+    # CF only health-checks plain TCP since the listener is gRPC h2c
+    # and a HEAD / on the gRPC service path returns 415.
+    health-check-type: port
     env:
-      WS_PATH: /
+      # The sing-box release tag to download on first boot. Pin to a
+      # known-good tag so a CF restage doesn't silently upgrade to a
+      # broken release. Update by hand when validated.
+      SINGBOX_TAG: v1.12.19-mod.1
+      SINGBOX_REPO: justinwoo280/sing-box
+      # gRPC service name on this listener. Must match what the
+      # client (SekaiMod / GUI) sends. SAP gateway can route by
+      # path, so this also doubles as a per-tenant identifier.
+      GRPC_SERVICE_NAME: ewp
+      # Generate per deployment with `uuidgen` and store in CF env
+      # via `cf set-env`. Do NOT commit a real UUID here.
+      UUID: REPLACE_ME_RUN_uuidgen

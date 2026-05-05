@@ -1,53 +1,158 @@
 name: Deploy to SAP BTP Cloud Foundry
 
 on:
+  # Auto-deploy when start.sh / manifest.yml changes on main.
+  push:
+    branches: [main]
+    paths:
+      - "manifest.yml"
+      - "start.sh"
+      - ".github/workflows/deploy-cf.yml"
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Validate manifest only (do not push)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      force_redownload:
+        description: "Force sing-box redownload by bumping a marker var"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+# Avoid two deploys overlapping; cancel the older one.
+concurrency:
+  group: cf-deploy
+  cancel-in-progress: false
 
 jobs:
   deploy:
     name: Deploy ewp-server
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download ewp-core server binary
-        run: |
-          curl -fsSL \
-            https://github.com/justinwoo280/ech-workers/releases/download/v1.14.1/ewp-core-server-v1.14.1-linux-amd64 \
-            -o ewp-server
-          chmod +x ewp-server
-
+      # ---------------------------------------------------------------
+      # Install CF CLI v8 (apt-key is deprecated, use signed-by gpg).
+      # ---------------------------------------------------------------
       - name: Install CF CLI
         run: |
-          wget -q -O - https://packages.cloudfoundry.org/debian/cli.cloudfoundry.org.key | sudo apt-key add -
-          echo "deb https://packages.cloudfoundry.org/debian stable main" | sudo tee /etc/apt/sources.list.d/cloudfoundry-cli.list
-          sudo apt-get update && sudo apt-get install -y cf8-cli
+          curl -fsSL https://packages.cloudfoundry.org/debian/cli.cloudfoundry.org.key \
+            | sudo gpg --dearmor -o /usr/share/keyrings/cloudfoundry-cli-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudfoundry-cli-archive-keyring.gpg] https://packages.cloudfoundry.org/debian stable main" \
+            | sudo tee /etc/apt/sources.list.d/cloudfoundry-cli.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y cf8-cli
+          cf version
 
+      # ---------------------------------------------------------------
+      # Lint manifest + start.sh before reaching CF (cheap fail-fast).
+      # ---------------------------------------------------------------
+      - name: Lint
+        run: |
+          python3 -c "import yaml,sys; yaml.safe_load(open('manifest.yml')); print('manifest.yml OK')"
+          bash -n start.sh && echo "start.sh syntax OK"
+
+      - name: Check required secrets present
+        env:
+          CF_API: ${{ secrets.CF_API }}
+          CF_USERNAME: ${{ secrets.CF_USERNAME }}
+          CF_PASSWORD: ${{ secrets.CF_PASSWORD }}
+          CF_ORG: ${{ secrets.CF_ORG }}
+          CF_SPACE: ${{ secrets.CF_SPACE }}
+          EWP_UUID: ${{ secrets.EWP_UUID }}
+        run: |
+          missing=0
+          for v in CF_API CF_USERNAME CF_PASSWORD CF_ORG CF_SPACE EWP_UUID; do
+            if [ -z "${!v}" ]; then
+              echo "::error::secret $v is not set"
+              missing=1
+            fi
+          done
+          [ "$missing" = "0" ]
+
+      # ---------------------------------------------------------------
+      # Stop here on dry_run.
+      # ---------------------------------------------------------------
+      - name: Dry run notice
+        if: ${{ inputs.dry_run == 'true' }}
+        run: |
+          echo "::notice::dry_run=true, manifest validated, exiting before cf push"
+          exit 0
+
+      # ---------------------------------------------------------------
+      # Login. cf auth reads CF_USERNAME / CF_PASSWORD from env.
+      # ---------------------------------------------------------------
       - name: Login to SAP BTP Cloud Foundry
+        if: ${{ inputs.dry_run != 'true' }}
+        env:
+          CF_USERNAME: ${{ secrets.CF_USERNAME }}
+          CF_PASSWORD: ${{ secrets.CF_PASSWORD }}
         run: |
           cf api "${{ secrets.CF_API }}"
-          cf auth "${{ secrets.CF_USERNAME }}" "${{ secrets.CF_PASSWORD }}"
+          cf auth
           cf target -o "${{ secrets.CF_ORG }}" -s "${{ secrets.CF_SPACE }}"
 
-      - name: Set UUID env on CF app (if not set)
+      # ---------------------------------------------------------------
+      # Optional: nudge start.sh to redownload sing-box on next boot
+      # by bumping an env var (start.sh re-evaluates SINGBOX_TAG and
+      # the cache lives under $HOME/bin which a restage clears anyway,
+      # but this is an explicit override for force-bumps).
+      # ---------------------------------------------------------------
+      - name: Mark forced redownload
+        if: ${{ inputs.force_redownload == 'true' }}
         run: |
-          cf set-env ewp-server UUID "${{ secrets.EWP_UUID }}" || true
+          cf set-env ewp-server FORCE_REDOWNLOAD "$(date +%s)" || true
 
-      - name: Push app
+      # ---------------------------------------------------------------
+      # Push without start so we can inject UUID before the app boots.
+      # --strategy rolling gives zero-downtime updates if instances>1.
+      # ---------------------------------------------------------------
+      - name: Push (no-start)
+        if: ${{ inputs.dry_run != 'true' }}
         run: |
           cf push ewp-server \
             -f manifest.yml \
             --no-start
 
-      - name: Set envs and start
+      - name: Inject runtime secrets
+        if: ${{ inputs.dry_run != 'true' }}
         run: |
           cf set-env ewp-server UUID "${{ secrets.EWP_UUID }}"
-          cf set-env ewp-server WS_PATH "${{ secrets.EWP_WS_PATH }}"
+          # Optional: per-tenant gRPC service name override.
+          if [ -n "${{ secrets.GRPC_SERVICE_NAME }}" ]; then
+            cf set-env ewp-server GRPC_SERVICE_NAME "${{ secrets.GRPC_SERVICE_NAME }}"
+          fi
+
+      - name: Start
+        if: ${{ inputs.dry_run != 'true' }}
+        run: |
           cf start ewp-server
 
+      # ---------------------------------------------------------------
+      # Final report. Logs are tail-ed so a deploy failure surfaces
+      # the actual reason in the Actions UI without an extra step.
+      # ---------------------------------------------------------------
       - name: Show app info
+        if: ${{ always() && inputs.dry_run != 'true' }}
         run: |
-          cf app ewp-server
-          echo "Routes:"
-          cf routes | grep ewp-server
+          cf app ewp-server || true
+          echo "----- recent logs -----"
+          cf logs ewp-server --recent | tail -50 || true
+          echo "----- routes -----"
+          cf routes | grep ewp-server || true
+
+      # Always log out so concurrent runs don't share session state.
+      - name: Logout
+        if: ${{ always() && inputs.dry_run != 'true' }}
+        run: |
+          cf logout || true

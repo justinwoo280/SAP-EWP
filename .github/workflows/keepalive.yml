@@ -1,40 +1,123 @@
-name: Keep Alive - Restart ewp-server
+name: Keep Alive
+
+# Two-tier strategy:
+#   A. HTTP-ping every 10 minutes        -> very cheap, keeps CF
+#                                           routing layer warm and
+#                                           generates real traffic so
+#                                           SAP idle-detection counts
+#                                           the app as "in use".
+#   B. CF restart every 6 hours          -> guards against silent
+#                                           crashes / OOMs that the
+#                                           HTTP probe alone cannot
+#                                           recover from.
+#
+# Both jobs are independent. If one fails the other still runs.
 
 on:
   schedule:
-    - cron: '0 */8 * * *'
+    - cron: "*/10 * * * *"   # ping every 10 min
+    - cron: "0 */6 * * *"    # restart every 6 hours
   workflow_dispatch:
+    inputs:
+      action:
+        description: "Manual run mode"
+        required: false
+        default: "ping"
+        type: choice
+        options:
+          - "ping"
+          - "restart"
 
 jobs:
-  restart:
-    name: Restart ewp-server on SAP BTP CF
+  # =================================================================
+  # A. Cheap HTTP ping (no CF CLI, ~5 seconds end-to-end)
+  # =================================================================
+  ping:
+    name: HTTP ping
+    if: |
+      github.event.schedule == '*/10 * * * *' ||
+      (github.event_name == 'workflow_dispatch' && inputs.action == 'ping')
     runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Probe app endpoint
+        env:
+          # Set this secret to the public route of the app, e.g.
+          #   https://ewp-server.cfapps.eu10.hana.ondemand.com
+          # The path doesn't matter; even a 404/415 response keeps
+          # the app process alive (the request is served by the gRPC
+          # listener which counts as activity).
+          KEEPALIVE_URL: ${{ secrets.KEEPALIVE_URL }}
+        run: |
+          if [ -z "$KEEPALIVE_URL" ]; then
+            echo "::warning::KEEPALIVE_URL secret is not set; skipping ping"
+            exit 0
+          fi
+          # -m total timeout 20s, accept any HTTP response code as
+          # "the app is up". Connection refused / DNS fail / timeout
+          # is a real failure.
+          status=$(curl -ksS -o /dev/null -w '%{http_code}' -m 20 "$KEEPALIVE_URL" || echo "000")
+          echo "[ping] $KEEPALIVE_URL -> HTTP $status"
+          if [ "$status" = "000" ]; then
+            echo "::error::ping failed (connection / dns / timeout)"
+            exit 1
+          fi
 
+  # =================================================================
+  # B. Periodic CF restart (heavyweight, every 6h)
+  # =================================================================
+  restart:
+    name: CF restart
+    if: |
+      github.event.schedule == '0 */6 * * *' ||
+      (github.event_name == 'workflow_dispatch' && inputs.action == 'restart')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Install CF CLI
         run: |
-          wget -q -O - https://packages.cloudfoundry.org/debian/cli.cloudfoundry.org.key | sudo apt-key add -
-          echo "deb https://packages.cloudfoundry.org/debian stable main" | sudo tee /etc/apt/sources.list.d/cloudfoundry-cli.list
-          sudo apt-get update && sudo apt-get install -y cf8-cli
+          curl -fsSL https://packages.cloudfoundry.org/debian/cli.cloudfoundry.org.key \
+            | sudo gpg --dearmor -o /usr/share/keyrings/cloudfoundry-cli-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudfoundry-cli-archive-keyring.gpg] https://packages.cloudfoundry.org/debian stable main" \
+            | sudo tee /etc/apt/sources.list.d/cloudfoundry-cli.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y cf8-cli
 
-      - name: Login to SAP BTP Cloud Foundry
+      - name: Login
+        env:
+          CF_USERNAME: ${{ secrets.CF_USERNAME }}
+          CF_PASSWORD: ${{ secrets.CF_PASSWORD }}
         run: |
           cf api "${{ secrets.CF_API }}"
-          cf auth "${{ secrets.CF_USERNAME }}" "${{ secrets.CF_PASSWORD }}"
+          cf auth
           cf target -o "${{ secrets.CF_ORG }}" -s "${{ secrets.CF_SPACE }}"
 
-      - name: Restart app
+      - name: Inspect + recover
         run: |
-          STATUS=$(cf app ewp-server | grep "requested state:" | awk '{print $3}')
-          echo "[keepalive] Current state: ${STATUS}"
-          if [ "$STATUS" = "stopped" ]; then
-            echo "[keepalive] App is stopped, starting..."
-            cf start ewp-server
-          else
-            echo "[keepalive] App is running, restarting..."
-            cf restart ewp-server
-          fi
+          # cf app prints to both stdout and stderr; ignore exit code
+          # so we can branch on the textual output instead.
+          state=$(cf app ewp-server 2>/dev/null | awk '/^requested state:/{print $3}')
+          echo "[keepalive] requested state = ${state:-unknown}"
+          case "$state" in
+            stopped)
+              echo "[keepalive] app is stopped -> cf start"
+              cf start ewp-server
+              ;;
+            started|"")
+              # Soft restart preserves env vars and route bindings.
+              echo "[keepalive] app is started -> cf restart (rolling)"
+              cf restart ewp-server --strategy rolling || cf restart ewp-server
+              ;;
+            *)
+              echo "::warning::unexpected state '$state', falling back to start"
+              cf start ewp-server || true
+              ;;
+          esac
 
       - name: Verify
         run: |
-          cf app ewp-server | grep -E "state|memory|instances"
+          cf app ewp-server | grep -E "requested state|memory|instances|^#" || true
+
+      - name: Logout
+        if: always()
+        run: cf logout || true
